@@ -94,12 +94,13 @@ public:
         return *right_eye_disabler;
     }
 
-    void ReportLoadingProgramID(u64 program_ID);
+    void ApplyPerProgramSettings(u64 program_ID);
 
 private:
     void SubmitCmdList(u32 index);
 
-    void MemoryFill(u32 index);
+    // Interrupt index must be 0 or 1 to signal the relative PSC interrupt.
+    void MemoryFill(u32 index, u32 intr_index);
 
     void MemoryTransfer();
 

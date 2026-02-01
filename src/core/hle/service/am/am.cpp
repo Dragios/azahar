@@ -16,6 +16,7 @@
 #include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/zstd_compression.h"
 #include "core/core.h"
 #include "core/file_sys/certificate.h"
 #include "core/file_sys/errors.h"
@@ -54,16 +55,6 @@ constexpr u16 CATEGORY_DLP = 0x0001;
 constexpr u8 VARIATION_SYSTEM = 0x02;
 constexpr u32 TID_HIGH_UPDATE = 0x0004000E;
 constexpr u32 TID_HIGH_DLC = 0x0004008C;
-
-struct TitleInfo {
-    u64_le tid;
-    u64_le size;
-    u16_le version;
-    u16_le unused;
-    u32_le type;
-};
-
-static_assert(sizeof(TitleInfo) == 0x18, "Title info structure size is wrong");
 
 constexpr u8 OWNERSHIP_DOWNLOADED = 0x01;
 constexpr u8 OWNERSHIP_OWNED = 0x02;
@@ -105,6 +96,12 @@ NCCHCryptoFile::NCCHCryptoFile(const std::string& out_file, bool encrypted_conte
         file = std::make_unique<FileUtil::IOFile>(out_file, "wb");
     }
 
+    if (Settings::values.compress_cia_installs) {
+        std::array<u8, 4> magic = {'N', 'C', 'C', 'H'};
+        file = std::make_unique<FileUtil::Z3DSWriteIOFile>(
+            std::move(file), magic, FileUtil::Z3DSWriteIOFile::DEFAULT_FRAME_SIZE);
+    }
+
     if (!file->IsOpen()) {
         is_error = true;
     }
@@ -116,6 +113,7 @@ void NCCHCryptoFile::Write(const u8* buffer, std::size_t length) {
 
     if (is_not_ncch) {
         file->WriteBytes(buffer, length);
+        return;
     }
 
     const int kBlockSize = 0x200; ///< Size of ExeFS blocks (in bytes)
@@ -448,13 +446,16 @@ ResultVal<std::size_t> CIAFile::Read(u64 offset, std::size_t length, u8* buffer)
     return length;
 }
 
-Result CIAFile::WriteTicket() {
+CIAFile::InstallResult CIAFile::WriteTicket() {
+    InstallResult res{};
+    res.type = InstallResult::Type::TIK;
     auto load_result = container.LoadTicket(data, container.GetTicketOffset());
     if (load_result != Loader::ResultStatus::Success) {
         LOG_ERROR(Service_AM, "Could not read ticket from CIA.");
         // TODO: Correct result code.
-        return {ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
-                ErrorLevel::Permanent};
+        res.result = {ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
+                      ErrorLevel::Permanent};
+        return res;
     }
 
     const auto& ticket = container.GetTicket();
@@ -466,23 +467,30 @@ Result CIAFile::WriteTicket() {
     FileUtil::CreateFullPath(ticket_folder);
 
     // Save ticket
+    res.install_full_path = ticket_path;
     if (ticket.Save(ticket_path) != Loader::ResultStatus::Success) {
         LOG_ERROR(Service_AM, "Failed to install ticket file from CIA.");
         // TODO: Correct result code.
-        return FileSys::ResultFileNotFound;
+        res.result = FileSys::ResultFileNotFound;
+        return res;
     }
 
     install_state = CIAInstallState::TicketLoaded;
-    return ResultSuccess;
+    res.result = ResultSuccess;
+    return res;
 }
 
-Result CIAFile::WriteTitleMetadata(std::span<const u8> tmd_data, std::size_t offset) {
+CIAFile::InstallResult CIAFile::WriteTitleMetadata(std::span<const u8> tmd_data,
+                                                   std::size_t offset) {
+    InstallResult res{};
+    res.type = InstallResult::Type::TMD;
     auto load_result = container.LoadTitleMetadata(tmd_data, offset);
     if (load_result != Loader::ResultStatus::Success) {
         LOG_ERROR(Service_AM, "Could not read title metadata.");
         // TODO: Correct result code.
-        return {ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
-                ErrorLevel::Permanent};
+        res.result = {ErrCodes::InvalidCIAHeader, ErrorModule::AM, ErrorSummary::InvalidArgument,
+                      ErrorLevel::Permanent};
+        return res;
     }
 
     FileSys::TitleMetadata tmd = container.GetTitleMetadata();
@@ -503,13 +511,16 @@ Result CIAFile::WriteTitleMetadata(std::span<const u8> tmd_data, std::size_t off
     FileUtil::CreateFullPath(tmd_folder);
 
     // Save TMD so that we can start getting new .app paths
+    res.install_full_path = tmd_path;
     if (tmd.Save(tmd_path) != Loader::ResultStatus::Success) {
         LOG_ERROR(Service_AM, "Failed to install title metadata file from CIA.");
         // TODO: Correct result code.
-        return FileSys::ResultFileNotFound;
+        res.result = FileSys::ResultFileNotFound;
+        return res;
     }
 
-    return PrepareToImportContent(tmd);
+    res.result = PrepareToImportContent(tmd);
+    return res;
 }
 
 ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length, const u8* buffer) {
@@ -537,10 +548,18 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
             // to get the content paths to write to.
             const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
             if (i != current_content_index) {
+                // A previous content file was being installed, save it first
+                if (current_content_install_result.type == InstallResult::Type::APP) {
+                    install_results.push_back(current_content_install_result);
+                }
                 current_content_index = static_cast<u16>(i);
                 current_content_file =
                     std::make_unique<NCCHCryptoFile>(content_file_paths[i], decryption_authorized);
                 current_content_file->decryption_authorized = decryption_authorized;
+
+                current_content_install_result.type = InstallResult::Type::APP;
+                current_content_install_result.install_full_path = content_file_paths[i];
+                current_content_install_result.result = ResultSuccess;
             }
             auto& file = *current_content_file;
 
@@ -550,8 +569,11 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
             if ((tmd.GetContentTypeByIndex(i) & FileSys::TMDContentTypeFlag::Encrypted) != 0) {
                 if (!decryption_authorized) {
                     LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
-                    return Result(ErrorDescription::NotAuthorized, ErrorModule::AM,
-                                  ErrorSummary::InvalidState, ErrorLevel::Permanent);
+                    current_content_install_result.result =
+                        Result(ErrorDescription::NotAuthorized, ErrorModule::AM,
+                               ErrorSummary::InvalidState, ErrorLevel::Permanent);
+                    install_results.push_back(current_content_install_result);
+                    return current_content_install_result.result;
                 }
                 decryption_state->content[i].ProcessData(temp.data(), temp.data(), temp.size());
             }
@@ -559,8 +581,11 @@ ResultVal<std::size_t> CIAFile::WriteContentData(u64 offset, std::size_t length,
             file.Write(temp.data(), temp.size());
             if (file.IsError()) {
                 // This can never happen in real HW
-                return Result(ErrCodes::InvalidImportState, ErrorModule::AM,
-                              ErrorSummary::InvalidState, ErrorLevel::Permanent);
+                current_content_install_result.result =
+                    Result(ErrCodes::InvalidImportState, ErrorModule::AM,
+                           ErrorSummary::InvalidState, ErrorLevel::Permanent);
+                install_results.push_back(current_content_install_result);
+                return current_content_install_result.result;
             }
 
             // Keep tabs on how much of this content ID has been written so new range_min
@@ -623,14 +648,16 @@ ResultVal<std::size_t> CIAFile::Write(u64 offset, std::size_t length, bool flush
     // The end of our TMD is at the beginning of Content data, so ensure we have that much
     // buffered before trying to parse.
     if (written >= container.GetContentOffset() && install_state != CIAInstallState::TMDLoaded) {
-        auto result = WriteTicket();
-        if (result.IsError()) {
-            return result;
+        InstallResult result = WriteTicket();
+        install_results.push_back(result);
+        if (result.result.IsError()) {
+            return result.result;
         }
 
         result = WriteTitleMetadata(data, container.GetTitleMetadataOffset());
-        if (result.IsError()) {
-            return result;
+        install_results.push_back(result);
+        if (result.result.IsError()) {
+            return result.result;
         }
     }
 
@@ -642,6 +669,7 @@ ResultVal<std::size_t> CIAFile::Write(u64 offset, std::size_t length, bool flush
     // From this point forward, data will no longer be buffered in data
     auto result = WriteContentData(offset, length, buffer);
     if (result.Failed()) {
+        current_content_install_result.type = InstallResult::Type::NONE;
         return result;
     }
 
@@ -756,10 +784,19 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
         tmd.GetContentSizeByIndex(content_index) - content_written[content_index];
 
     if (content_index != current_content_index) {
+        // A previous content file was being installed, save it first
+        if (current_content_install_result.type == InstallResult::Type::APP) {
+            install_results.push_back(current_content_install_result);
+        }
+
         current_content_index = content_index;
         current_content_file = std::make_unique<NCCHCryptoFile>(content_file_paths[content_index],
                                                                 decryption_authorized);
         current_content_file->decryption_authorized = decryption_authorized;
+
+        current_content_install_result.type = InstallResult::Type::APP;
+        current_content_install_result.install_full_path = content_file_paths[content_index];
+        current_content_install_result.result = ResultSuccess;
     }
     auto& file = *current_content_file;
 
@@ -768,8 +805,11 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
     if ((tmd.GetContentTypeByIndex(content_index) & FileSys::TMDContentTypeFlag::Encrypted) != 0) {
         if (!decryption_authorized) {
             LOG_ERROR(Service_AM, "Blocked unauthorized encrypted CIA installation.");
-            return Result(ErrorDescription::NotAuthorized, ErrorModule::AM,
-                          ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            current_content_install_result.result =
+                Result(ErrorDescription::NotAuthorized, ErrorModule::AM, ErrorSummary::InvalidState,
+                       ErrorLevel::Permanent);
+            install_results.push_back(current_content_install_result);
+            return current_content_install_result.result;
         }
         decryption_state->content[content_index].ProcessData(temp.data(), temp.data(), temp.size());
     }
@@ -777,8 +817,11 @@ ResultVal<std::size_t> CIAFile::WriteContentDataIndexed(u16 content_index, u64 o
     file.Write(temp.data(), temp.size());
     if (file.IsError()) {
         // This can never happen in real HW
-        return Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
-                      ErrorLevel::Permanent);
+        current_content_install_result.result =
+            Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
+                   ErrorLevel::Permanent);
+        install_results.push_back(current_content_install_result);
+        return current_content_install_result.result;
     }
 
     content_written[content_index] += temp.size();
@@ -801,22 +844,36 @@ bool CIAFile::Close() {
         return true;
     is_closed = true;
 
-    bool complete =
-        from_cdn ? is_done
-                 : (install_state >= CIAInstallState::TMDLoaded &&
-                    content_written.size() == container.GetTitleMetadata().GetContentCount() &&
-                    std::all_of(content_written.begin(), content_written.end(),
-                                [this, i = 0](auto& bytes_written) mutable {
-                                    return bytes_written >=
-                                           container.GetContentSize(static_cast<u16>(i++));
-                                }));
+    // Commit last pending install result
+    if (current_content_install_result.type != InstallResult::Type::NONE) {
+        install_results.push_back(current_content_install_result);
+        current_content_install_result.type = InstallResult::Type::NONE;
+    }
+
+    bool complete;
+
+    if (is_cancel) {
+        complete = false;
+    } else {
+        complete =
+            from_cdn ? is_done
+                     : (install_state >= CIAInstallState::TMDLoaded &&
+                        content_written.size() == container.GetTitleMetadata().GetContentCount() &&
+                        std::all_of(content_written.begin(), content_written.end(),
+                                    [this, i = 0](auto& bytes_written) mutable {
+                                        return bytes_written >=
+                                               container.GetContentSize(static_cast<u16>(i++));
+                                    }));
+    }
 
     // Install aborted
     if (!complete) {
-        LOG_ERROR(Service_AM, "CIAFile closed prematurely, aborting install...");
+        LOG_ERROR(Service_AM, "CIAFile closed prematurely or cancelled, aborting install...");
         if (!is_additional_content) {
-            FileUtil::DeleteDirRecursively(
-                GetTitlePath(media_type, container.GetTitleMetadata().GetTitleID()));
+            // Only delete the content folder as there may be user save data in the title folder.
+            const std::string title_content_path =
+                GetTitlePath(media_type, container.GetTitleMetadata().GetTitleID()) + "content/";
+            FileUtil::DeleteDirRecursively(title_content_path);
         }
         return true;
     }
@@ -824,8 +881,15 @@ bool CIAFile::Close() {
     // Clean up older content data if we installed newer content on top
     std::string old_tmd_path =
         GetTitleMetadataPath(media_type, container.GetTitleMetadata().GetTitleID(), false);
-    std::string new_tmd_path =
-        GetTitleMetadataPath(media_type, container.GetTitleMetadata().GetTitleID(), true);
+    std::string new_tmd_path = old_tmd_path;
+
+    for (auto result : install_results) {
+        if (result.type == InstallResult::Type::TMD && result.result.IsSuccess()) {
+            new_tmd_path = result.install_full_path;
+            break;
+        }
+    }
+
     if (FileUtil::Exists(new_tmd_path) && old_tmd_path != new_tmd_path) {
         FileSys::TitleMetadata old_tmd;
         FileSys::TitleMetadata new_tmd;
@@ -954,7 +1018,7 @@ bool TMDFile::Close() {
 void TMDFile::Flush() const {}
 
 Result TMDFile::Commit() {
-    return importing_title->cia_file.WriteTitleMetadata(data, 0);
+    return importing_title->cia_file.WriteTitleMetadata(data, 0).result;
 }
 
 ContentFile::~ContentFile() {
@@ -1003,8 +1067,16 @@ InstallStatus InstallCIA(const std::string& path,
         return InstallStatus::ErrorFileNotFound;
     }
 
+    std::unique_ptr<FileUtil::IOFile> in_file = std::make_unique<FileUtil::IOFile>(path, "rb");
+    bool is_compressed =
+        FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(in_file.get()) != std::nullopt;
+    if (is_compressed) {
+        in_file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(in_file));
+    }
+
     FileSys::CIAContainer container;
-    if (container.Load(path) == Loader::ResultStatus::Success) {
+    if (container.Load(in_file.get()) == Loader::ResultStatus::Success) {
+        in_file->Seek(0, SEEK_SET);
         Service::AM::CIAFile installFile(
             Core::System::GetInstance(),
             Service::AM::GetTitleMediaType(container.GetTitleMetadata().GetTitleID()));
@@ -1014,18 +1086,12 @@ InstallStatus InstallCIA(const std::string& path,
             return InstallStatus::ErrorEncrypted;
         }
 
-        FileUtil::IOFile file(path, "rb");
-        if (!file.IsOpen()) {
-            LOG_ERROR(Service_AM, "Could not open CIA file '{}'.", path);
-            return InstallStatus::ErrorFailedToOpenFile;
-        }
-
         std::vector<u8> buffer;
         buffer.resize(0x10000);
-        auto file_size = file.GetSize();
+        auto file_size = in_file->GetSize();
         std::size_t total_bytes_read = 0;
         while (total_bytes_read != file_size) {
-            std::size_t bytes_read = file.ReadBytes(buffer.data(), buffer.size());
+            std::size_t bytes_read = in_file->ReadBytes(buffer.data(), buffer.size());
             auto result = installFile.Write(static_cast<u64>(total_bytes_read), bytes_read, true,
                                             false, static_cast<u8*>(buffer.data()));
 
@@ -1041,43 +1107,109 @@ InstallStatus InstallCIA(const std::string& path,
         }
         installFile.Close();
 
-        LOG_INFO(Service_AM, "Installed {} successfully.", path);
-
-        const FileUtil::DirectoryEntryCallable callback =
-            [&callback](u64* num_entries_out, const std::string& directory,
-                        const std::string& virtual_name) -> bool {
-            const std::string physical_name = directory + DIR_SEP + virtual_name;
-            const bool is_dir = FileUtil::IsDirectory(physical_name);
-            if (!is_dir) {
-                std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(physical_name);
-                if (!loader) {
-                    return true;
-                }
-
-                bool executable = false;
-                const auto res = loader->IsExecutable(executable);
-                if (res == Loader::ResultStatus::ErrorEncrypted) {
-                    return false;
-                }
-                return true;
-            } else {
-                return FileUtil::ForeachDirectoryEntry(nullptr, physical_name, callback);
+        InstallStatus install_res = InstallStatus::Success;
+        for (auto result : installFile.GetInstallResults()) {
+            if (result.type != CIAFile::InstallResult::Type::APP || result.result.IsError()) {
+                continue;
             }
-        };
-        if (!FileUtil::ForeachDirectoryEntry(
-                nullptr,
-                GetTitlePath(
-                    Service::AM::GetTitleMediaType(container.GetTitleMetadata().GetTitleID()),
-                    container.GetTitleMetadata().GetTitleID()),
-                callback)) {
-            LOG_ERROR(Service_AM, "CIA {} contained encrypted files.", path);
-            return InstallStatus::ErrorEncrypted;
+
+            std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(result.install_full_path);
+            if (!loader) {
+                continue;
+            }
+
+            bool executable = false;
+            const auto res = loader->IsExecutable(executable);
+            if (res == Loader::ResultStatus::ErrorEncrypted) {
+                LOG_ERROR(Service_AM, "CIA contains encrypted content: {}", path,
+                          result.install_full_path);
+                install_res = InstallStatus::ErrorEncrypted;
+            }
         }
-        return InstallStatus::Success;
+        if (install_res == InstallStatus::Success) {
+            LOG_INFO(Service_AM, "Installed {} successfully.", path);
+        }
+        return install_res;
     }
 
     LOG_ERROR(Service_AM, "CIA file {} is invalid!", path);
     return InstallStatus::ErrorInvalid;
+}
+
+InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed,
+                                bool check_encryption) {
+    if (!FileUtil::Exists(path)) {
+        LOG_ERROR(Service_AM, "File {} does not exist!", path);
+        return InstallStatus::ErrorFileNotFound;
+    }
+
+    std::unique_ptr<FileUtil::IOFile> in_file = std::make_unique<FileUtil::IOFile>(path, "rb");
+    is_compressed = FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(in_file.get()) != std::nullopt;
+    if (is_compressed) {
+        in_file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(in_file));
+    }
+
+    FileSys::CIAContainer container;
+    if (container.Load(in_file.get()) == Loader::ResultStatus::Success) {
+        in_file->Seek(0, SEEK_SET);
+        const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
+
+        if (check_encryption) {
+            if (tmd.HasEncryptedContent(container.GetHeader())) {
+                return InstallStatus::ErrorEncrypted;
+            }
+
+            for (size_t i = 0; i < tmd.GetContentCount(); i++) {
+                u64 offset = container.GetContentOffset(i);
+                NCCH_Header ncch;
+                const auto read = in_file->ReadAtBytes(&ncch, sizeof(ncch), offset);
+                if (read != sizeof(ncch)) {
+                    return InstallStatus::ErrorInvalid;
+                }
+                if (ncch.magic != Loader::MakeMagic('N', 'C', 'C', 'H')) {
+                    return InstallStatus::ErrorInvalid;
+                }
+                if (!ncch.no_crypto) {
+                    return InstallStatus::ErrorEncrypted;
+                }
+            }
+        }
+
+        return InstallStatus::Success;
+    }
+
+    return InstallStatus::ErrorInvalid;
+}
+
+ResultVal<std::pair<TitleInfo, std::unique_ptr<Loader::SMDH>>> GetCIAInfos(
+    const std::string& path) {
+    if (!FileUtil::Exists(path)) {
+        LOG_ERROR(Service_AM, "File {} does not exist!", path);
+        return ResultUnknown;
+    }
+
+    std::unique_ptr<FileUtil::IOFile> in_file = std::make_unique<FileUtil::IOFile>(path, "rb");
+    FileSys::CIAContainer container;
+    if (container.Load(in_file.get()) == Loader::ResultStatus::Success) {
+        in_file->Seek(0, SEEK_SET);
+        const FileSys::TitleMetadata& tmd = container.GetTitleMetadata();
+
+        TitleInfo info{};
+        info.tid = tmd.GetTitleID();
+        info.version = tmd.GetTitleVersion();
+        info.size = tmd.GetCombinedContentSize(container.GetHeader());
+        info.type = tmd.GetTitleType();
+
+        const auto& cia_smdh = container.GetSMDH();
+        std::unique_ptr<Loader::SMDH> smdh{};
+        if (cia_smdh) {
+            smdh = std::make_unique<Loader::SMDH>(*cia_smdh);
+        }
+
+        return std::pair<TitleInfo, std::unique_ptr<Loader::SMDH>>(info, std::move(smdh));
+    }
+
+    return ResultUnknown;
 }
 
 u64 GetTitleUpdateId(u64 title_id) {
@@ -1153,7 +1285,7 @@ std::string GetTitleContentPath(Service::FS::MediaType media_type, u64 tid, std:
         auto fs_user =
             Core::System::GetInstance().ServiceManager().GetService<Service::FS::FS_USER>(
                 "fs:USER");
-        return fs_user->GetCurrentGamecardPath();
+        return fs_user->GetRegisteredGamecardPath();
     }
 
     std::string content_path = GetTitlePath(media_type, tid) + "content/";
@@ -1198,7 +1330,7 @@ std::string GetTitlePath(Service::FS::MediaType media_type, u64 tid) {
         auto fs_user =
             Core::System::GetInstance().ServiceManager().GetService<Service::FS::FS_USER>(
                 "fs:USER");
-        return fs_user->GetCurrentGamecardPath();
+        return fs_user->GetRegisteredGamecardPath();
     }
 
     return "";
@@ -1219,7 +1351,7 @@ std::string GetMediaTitlePath(Service::FS::MediaType media_type) {
         auto fs_user =
             Core::System::GetInstance().ServiceManager().GetService<Service::FS::FS_USER>(
                 "fs:USER");
-        return fs_user->GetCurrentGamecardPath();
+        return fs_user->GetRegisteredGamecardPath();
     }
 
     return "";
@@ -1282,39 +1414,52 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
 
     LOG_DEBUG(Service_AM, "Starting title scan for media_type={}", static_cast<int>(media_type));
 
-    std::string title_path = GetMediaTitlePath(media_type);
-
-    FileUtil::FSTEntry entries;
-    FileUtil::ScanDirectoryTree(title_path, entries, 1, &stop_scan_flag);
-    for (const FileUtil::FSTEntry& tid_high : entries.children) {
-        if (stop_scan_flag) {
-            break;
+    if (media_type == FS::MediaType::GameCard) {
+        const auto& cartridge = system.GetCartridge();
+        if (!cartridge.empty()) {
+            u64 program_id = 0;
+            FileSys::NCCHContainer cartridge_ncch(cartridge);
+            Loader::ResultStatus res = cartridge_ncch.ReadProgramId(program_id);
+            if (res == Loader::ResultStatus::Success) {
+                am_title_list[static_cast<u32>(media_type)].push_back(program_id);
+            }
         }
-        for (const FileUtil::FSTEntry& tid_low : tid_high.children) {
+    } else {
+        std::string title_path = GetMediaTitlePath(media_type);
+
+        FileUtil::FSTEntry entries;
+        FileUtil::ScanDirectoryTree(title_path, entries, 1, &stop_scan_flag);
+        for (const FileUtil::FSTEntry& tid_high : entries.children) {
             if (stop_scan_flag) {
                 break;
             }
-            std::string tid_string = tid_high.virtualName + tid_low.virtualName;
+            for (const FileUtil::FSTEntry& tid_low : tid_high.children) {
+                if (stop_scan_flag) {
+                    break;
+                }
+                std::string tid_string = tid_high.virtualName + tid_low.virtualName;
 
-            if (tid_string.length() == TITLE_ID_VALID_LENGTH) {
-                const u64 tid = std::stoull(tid_string, nullptr, 16);
+                if (tid_string.length() == TITLE_ID_VALID_LENGTH) {
+                    const u64 tid = std::stoull(tid_string, nullptr, 16);
 
-                if (tid & TWL_TITLE_ID_FLAG) {
-                    // TODO(PabloMK7) Move to TWL Nand, for now only check that
-                    // the contents exists in CTR Nand as this is a SRL file
-                    // instead of NCCH.
-                    if (FileUtil::Exists(GetTitleContentPath(media_type, tid))) {
-                        am_title_list[static_cast<u32>(media_type)].push_back(tid);
-                    }
-                } else {
-                    FileSys::NCCHContainer container(GetTitleContentPath(media_type, tid));
-                    if (container.Load() == Loader::ResultStatus::Success) {
-                        am_title_list[static_cast<u32>(media_type)].push_back(tid);
+                    if (tid & TWL_TITLE_ID_FLAG) {
+                        // TODO(PabloMK7) Move to TWL Nand, for now only check that
+                        // the contents exists in CTR Nand as this is a SRL file
+                        // instead of NCCH.
+                        if (FileUtil::Exists(GetTitleContentPath(media_type, tid))) {
+                            am_title_list[static_cast<u32>(media_type)].push_back(tid);
+                        }
+                    } else {
+                        FileSys::NCCHContainer container(GetTitleContentPath(media_type, tid));
+                        if (container.Load() == Loader::ResultStatus::Success) {
+                            am_title_list[static_cast<u32>(media_type)].push_back(tid);
+                        }
                     }
                 }
             }
         }
     }
+
     LOG_DEBUG(Service_AM, "Finished title scan for media_type={}", static_cast<int>(media_type));
 }
 
@@ -1323,6 +1468,7 @@ void Module::ScanForAllTitles() {
         ScanForTicketsImpl();
         ScanForTitlesImpl(Service::FS::MediaType::NAND);
         ScanForTitlesImpl(Service::FS::MediaType::SDMC);
+        ScanForTitlesImpl(Service::FS::MediaType::GameCard);
     } else {
         scan_all_future = std::async([this]() {
             std::scoped_lock lock(am_lists_mutex);
@@ -1332,6 +1478,9 @@ void Module::ScanForAllTitles() {
             }
             if (!stop_scan_flag) {
                 ScanForTitlesImpl(Service::FS::MediaType::SDMC);
+            }
+            if (!stop_scan_flag) {
+                ScanForTitlesImpl(Service::FS::MediaType::GameCard);
             }
         });
     }
@@ -1855,30 +2004,75 @@ void Module::Interface::GetProgramList(Kernel::HLERequestContext& ctx) {
     }
 }
 
-Result GetTitleInfoFromList(std::span<const u64> title_id_list, Service::FS::MediaType media_type,
+Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_list,
+                            Service::FS::MediaType media_type,
                             std::vector<TitleInfo>& title_info_out) {
     title_info_out.reserve(title_id_list.size());
     for (u32 i = 0; i < title_id_list.size(); i++) {
-        std::string tmd_path = GetTitleMetadataPath(media_type, title_id_list[i]);
+        if (media_type == Service::FS::MediaType::GameCard) {
+            auto& cartridge = system.GetCartridge();
+            if (cartridge.empty()) {
+                LOG_DEBUG(Service_AM, "cartridge not inserted");
+                return Result(ErrorDescription::NotFound, ErrorModule::AM,
+                              ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
 
-        TitleInfo title_info = {};
-        title_info.tid = title_id_list[i];
+            FileSys::NCCHContainer ncch_container(cartridge);
+            if (ncch_container.Load() != Loader::ResultStatus::Success ||
+                !ncch_container.IsNCSD()) {
+                LOG_ERROR(Service_AM, "failed to load cartridge card");
+                return Result(ErrorDescription::NotFound, ErrorModule::AM,
+                              ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
 
-        FileSys::TitleMetadata tmd;
-        if (tmd.Load(tmd_path) == Loader::ResultStatus::Success) {
-            // TODO(shinyquagsire23): This is the total size of all files this process owns,
-            // including savefiles and other content. This comes close but is off.
-            title_info.size = tmd.GetContentSizeByIndex(FileSys::TMDContentIndex::Main);
-            title_info.version = tmd.GetTitleVersion();
-            title_info.type = tmd.GetTitleType();
+            // This is what Process9 does for getting the information, from disassembly.
+            // It is still unclear what do those values mean, like the title info type.
+            if (ncch_container.exheader_header.arm11_system_local_caps.program_id !=
+                title_id_list[i]) {
+                LOG_DEBUG(Service_AM,
+                          "cartridge has different title ID than requested title_id={:016X} != "
+                          "cartridge_title_id={:016X}",
+                          title_id_list[i],
+                          ncch_container.exheader_header.arm11_system_local_caps.program_id);
+                return Result(ErrorDescription::NotFound, ErrorModule::AM,
+                              ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
+
+            TitleInfo title_info = {};
+            title_info.tid = title_id_list[i];
+            title_info.version =
+                (*reinterpret_cast<u16_le*>(
+                     &ncch_container.exheader_header.codeset_info.flags.remaster_version)
+                 << 10) &
+                0xFC00;
+            title_info.size = 0;
+            title_info.type = 0x40;
+
+            LOG_DEBUG(Service_AM, "found title_id={:016X} version={:04X}", title_id_list[i],
+                      title_info.version);
+            title_info_out.push_back(title_info);
         } else {
-            LOG_DEBUG(Service_AM, "not found title_id={:016X}", title_id_list[i]);
-            return Result(ErrorDescription::NotFound, ErrorModule::AM, ErrorSummary::InvalidState,
-                          ErrorLevel::Permanent);
+            std::string tmd_path = GetTitleMetadataPath(media_type, title_id_list[i]);
+
+            TitleInfo title_info = {};
+            title_info.tid = title_id_list[i];
+
+            FileSys::TitleMetadata tmd;
+            if (tmd.Load(tmd_path) == Loader::ResultStatus::Success) {
+                // TODO(shinyquagsire23): This is the total size of all files this process owns,
+                // including savefiles and other content. This comes close but is off.
+                title_info.size = tmd.GetContentSizeByIndex(FileSys::TMDContentIndex::Main);
+                title_info.version = tmd.GetTitleVersion();
+                title_info.type = tmd.GetTitleType();
+            } else {
+                LOG_DEBUG(Service_AM, "not found title_id={:016X}", title_id_list[i]);
+                return Result(ErrorDescription::NotFound, ErrorModule::AM,
+                              ErrorSummary::InvalidState, ErrorLevel::Permanent);
+            }
+            LOG_DEBUG(Service_AM, "found title_id={:016X} version={:04X}", title_id_list[i],
+                      title_info.version);
+            title_info_out.push_back(title_info);
         }
-        LOG_DEBUG(Service_AM, "found title_id={:016X} version={:04X}", title_id_list[i],
-                  title_info.version);
-        title_info_out.push_back(title_info);
     }
 
     return ResultSuccess;
@@ -2010,7 +2204,7 @@ void Module::Interface::GetProgramInfosImpl(Kernel::HLERequestContext& ctx, bool
                 }
 
                 if (async_data->res.IsSuccess()) {
-                    async_data->res = GetTitleInfoFromList(async_data->title_id_list,
+                    async_data->res = GetTitleInfoFromList(am->system, async_data->title_id_list,
                                                            async_data->media_type, async_data->out);
                 }
                 return 0;
@@ -2224,7 +2418,7 @@ void Module::Interface::GetDLCTitleInfos(Kernel::HLERequestContext& ctx) {
                 }
 
                 if (async_data->res.IsSuccess()) {
-                    async_data->res = GetTitleInfoFromList(async_data->title_id_list,
+                    async_data->res = GetTitleInfoFromList(am->system, async_data->title_id_list,
                                                            async_data->media_type, async_data->out);
                 }
                 return 0;
@@ -2371,7 +2565,7 @@ void Module::Interface::GetPatchTitleInfos(Kernel::HLERequestContext& ctx) {
                 }
 
                 if (async_data->res.IsSuccess()) {
-                    async_data->res = GetTitleInfoFromList(async_data->title_id_list,
+                    async_data->res = GetTitleInfoFromList(am->system, async_data->title_id_list,
                                                            async_data->media_type, async_data->out);
                 }
                 return 0;
@@ -3088,91 +3282,6 @@ void Module::Interface::CheckContentRightsIgnorePlatform(Kernel::HLERequestConte
     LOG_DEBUG(Service_AM, "tid={:016x}, content_index={}", tid, content_index);
 }
 
-void Module::Interface::BeginImportProgram(Kernel::HLERequestContext& ctx) {
-    IPC::RequestParser rp(ctx);
-    auto media_type = static_cast<Service::FS::MediaType>(rp.Pop<u8>());
-
-    if (am->cia_installing) {
-        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-        rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
-                       ErrorLevel::Permanent));
-        return;
-    }
-
-    // Create our CIAFile handle for the app to write to, and while the app writes
-    // Citra will store contents out to sdmc/nand
-    const FileSys::Path cia_path = {};
-    auto file = std::make_shared<Service::FS::File>(
-        am->system.Kernel(), std::make_unique<CIAFile>(am->system, media_type), cia_path);
-
-    am->cia_installing = true;
-
-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
-    rb.Push(ResultSuccess); // No error
-    rb.PushCopyObjects(file->Connect());
-
-    LOG_WARNING(Service_AM, "(STUBBED) media_type={}", media_type);
-}
-
-void Module::Interface::BeginImportProgramTemporarily(Kernel::HLERequestContext& ctx) {
-    IPC::RequestParser rp(ctx);
-
-    if (am->cia_installing) {
-        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-        rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
-                       ErrorLevel::Permanent));
-        return;
-    }
-
-    // Note: This function should register the title in the temp_i.db database, but we can get away
-    // with not doing that because we traverse the file system to detect installed titles.
-    // Create our CIAFile handle for the app to write to, and while the app writes Citra will store
-    // contents out to sdmc/nand
-    const FileSys::Path cia_path = {};
-    auto file = std::make_shared<Service::FS::File>(
-        am->system.Kernel(), std::make_unique<CIAFile>(am->system, FS::MediaType::NAND), cia_path);
-
-    am->cia_installing = true;
-
-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
-    rb.Push(ResultSuccess); // No error
-    rb.PushCopyObjects(file->Connect());
-
-    LOG_WARNING(Service_AM, "(STUBBED)");
-}
-
-void Module::Interface::EndImportProgram(Kernel::HLERequestContext& ctx) {
-    IPC::RequestParser rp(ctx);
-    [[maybe_unused]] const auto cia = rp.PopObject<Kernel::ClientSession>();
-
-    LOG_DEBUG(Service_AM, "");
-
-    am->ScanForAllTitles();
-
-    am->cia_installing = false;
-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-    rb.Push(ResultSuccess);
-}
-
-void Module::Interface::EndImportProgramWithoutCommit(Kernel::HLERequestContext& ctx) {
-    IPC::RequestParser rp(ctx);
-    [[maybe_unused]] const auto cia = rp.PopObject<Kernel::ClientSession>();
-
-    // Note: This function is basically a no-op for us since we don't use title.db or ticket.db
-    // files to keep track of installed titles.
-    am->ScanForAllTitles();
-
-    am->cia_installing = false;
-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-    rb.Push(ResultSuccess);
-
-    LOG_WARNING(Service_AM, "(STUBBED)");
-}
-
-void Module::Interface::CommitImportPrograms(Kernel::HLERequestContext& ctx) {
-    CommitImportTitlesImpl(ctx, false, false);
-}
-
 /// Wraps all File operations to allow adding an offset to them.
 class AMFileWrapper : public FileSys::FileBackend {
 public:
@@ -3288,6 +3397,123 @@ ResultVal<T*> GetFileBackendFromSession(std::shared_ptr<Kernel::ClientSession> f
     return Kernel::ResultNotImplemented;
 }
 
+void Module::Interface::BeginImportProgram(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    auto media_type = static_cast<Service::FS::MediaType>(rp.Pop<u8>());
+
+    if (am->cia_installing) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
+                       ErrorLevel::Permanent));
+        return;
+    }
+
+    // Create our CIAFile handle for the app to write to, and while the app writes
+    // Citra will store contents out to sdmc/nand
+    const FileSys::Path cia_path = {};
+    auto file = std::make_shared<Service::FS::File>(
+        am->system.Kernel(), std::make_unique<CIAFile>(am->system, media_type), cia_path);
+
+    am->cia_installing = true;
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+    rb.Push(ResultSuccess); // No error
+    rb.PushCopyObjects(file->Connect());
+
+    LOG_WARNING(Service_AM, "(STUBBED) media_type={}", media_type);
+}
+
+void Module::Interface::BeginImportProgramTemporarily(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+
+    if (am->cia_installing) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(Result(ErrCodes::InvalidImportState, ErrorModule::AM, ErrorSummary::InvalidState,
+                       ErrorLevel::Permanent));
+        return;
+    }
+
+    // Note: This function should register the title in the temp_i.db database, but we can get away
+    // with not doing that because we traverse the file system to detect installed titles.
+    // Create our CIAFile handle for the app to write to, and while the app writes Citra will store
+    // contents out to sdmc/nand
+    const FileSys::Path cia_path = {};
+    std::shared_ptr<Service::FS::File> file;
+    {
+        auto cia_file = std::make_unique<CIAFile>(am->system, FS::MediaType::NAND);
+
+        AuthorizeCIAFileDecryption(cia_file.get(), ctx);
+
+        file =
+            std::make_shared<Service::FS::File>(am->system.Kernel(), std::move(cia_file), cia_path);
+    }
+    am->cia_installing = true;
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+    rb.Push(ResultSuccess); // No error
+    rb.PushCopyObjects(file->Connect());
+
+    LOG_WARNING(Service_AM, "(STUBBED)");
+}
+
+void Module::Interface::CancelImportProgram(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const auto cia = rp.PopObject<Kernel::ClientSession>();
+
+    LOG_DEBUG(Service_AM, "");
+
+    auto cia_file = GetFileBackendFromSession<CIAFile>(cia);
+    if (cia_file.Succeeded()) {
+        cia_file.Unwrap()->Cancel();
+    }
+
+    am->cia_installing = false;
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    rb.Push(ResultSuccess);
+}
+
+void Module::Interface::EndImportProgram(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const auto cia = rp.PopObject<Kernel::ClientSession>();
+
+    LOG_DEBUG(Service_AM, "");
+
+    auto cia_file = GetFileBackendFromSession<CIAFile>(cia);
+    if (cia_file.Succeeded()) {
+        cia_file.Unwrap()->Close();
+    }
+
+    am->ScanForAllTitles();
+
+    am->cia_installing = false;
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    rb.Push(ResultSuccess);
+}
+
+void Module::Interface::EndImportProgramWithoutCommit(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const auto cia = rp.PopObject<Kernel::ClientSession>();
+
+    auto cia_file = GetFileBackendFromSession<CIAFile>(cia);
+    if (cia_file.Succeeded()) {
+        cia_file.Unwrap()->Close();
+    }
+
+    // Note: This function is basically a no-op for us since we don't use title.db or ticket.db
+    // files to keep track of installed titles.
+    am->ScanForAllTitles();
+
+    am->cia_installing = false;
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    rb.Push(ResultSuccess);
+
+    LOG_WARNING(Service_AM, "(STUBBED)");
+}
+
+void Module::Interface::CommitImportPrograms(Kernel::HLERequestContext& ctx) {
+    CommitImportTitlesImpl(ctx, false, false);
+}
+
 void Module::Interface::GetProgramInfoFromCia(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     [[maybe_unused]] const auto media_type = static_cast<FS::MediaType>(rp.Pop<u8>());
@@ -3322,7 +3548,7 @@ void Module::Interface::GetProgramInfoFromCia(Kernel::HLERequestContext& ctx) {
     title_info.version = tmd.GetTitleVersion();
     title_info.type = tmd.GetTitleType();
 
-    IPC::RequestBuilder rb = rp.MakeBuilder(8, 0);
+    IPC::RequestBuilder rb = rp.MakeBuilder(7, 0);
     rb.Push(ResultSuccess);
     rb.PushRaw<TitleInfo>(title_info);
 }

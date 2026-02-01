@@ -147,7 +147,7 @@ void Config::ReadValues() {
     ReadSetting("Renderer", Settings::values.use_shader_jit);
     ReadSetting("Renderer", Settings::values.resolution_factor);
     ReadSetting("Renderer", Settings::values.use_disk_shader_cache);
-    ReadSetting("Renderer", Settings::values.use_vsync_new);
+    ReadSetting("Renderer", Settings::values.use_vsync);
     ReadSetting("Renderer", Settings::values.texture_filter);
     ReadSetting("Renderer", Settings::values.texture_sampling);
     ReadSetting("Renderer", Settings::values.turbo_limit);
@@ -160,11 +160,11 @@ void Config::ReadValues() {
 
     ReadSetting("Renderer", Settings::values.render_3d);
     ReadSetting("Renderer", Settings::values.factor_3d);
-    std::string default_shader = "none (builtin)";
+    std::string default_shader = "None (builtin)";
     if (Settings::values.render_3d.GetValue() == Settings::StereoRenderOption::Anaglyph)
-        default_shader = "dubois (builtin)";
+        default_shader = "Dubois (builtin)";
     else if (Settings::values.render_3d.GetValue() == Settings::StereoRenderOption::Interlaced)
-        default_shader = "horizontal (builtin)";
+        default_shader = "Horizontal (builtin)";
     Settings::values.pp_shader_name =
         sdl2_config->GetString("Renderer", "pp_shader_name", default_shader);
     ReadSetting("Renderer", Settings::values.filter_mode);
@@ -172,9 +172,11 @@ void Config::ReadValues() {
     ReadSetting("Renderer", Settings::values.bg_red);
     ReadSetting("Renderer", Settings::values.bg_green);
     ReadSetting("Renderer", Settings::values.bg_blue);
+    ReadSetting("Renderer", Settings::values.custom_second_layer_opacity);
     ReadSetting("Renderer", Settings::values.delay_game_render_thread_us);
     ReadSetting("Renderer", Settings::values.disable_right_eye_render);
-
+    ReadSetting("Renderer", Settings::values.swap_eyes_3d);
+    ReadSetting("Renderer", Settings::values.render_3d_which_display);
     // Layout
     // Somewhat inelegant solution to ensure layout value is between 0 and 5 on read
     // since older config files may have other values
@@ -209,6 +211,9 @@ void Config::ReadValues() {
         static_cast<Settings::PortraitLayoutOption>(sdl2_config->GetInteger(
             "Layout", "portrait_layout_option",
             static_cast<int>(Settings::PortraitLayoutOption::PortraitTopFullWidth)));
+    Settings::values.secondary_display_layout = static_cast<Settings::SecondaryDisplayLayout>(
+        sdl2_config->GetInteger("Layout", "secondary_display_layout",
+                                static_cast<int>(Settings::SecondaryDisplayLayout::None)));
     ReadSetting("Layout", Settings::values.custom_portrait_top_x);
     ReadSetting("Layout", Settings::values.custom_portrait_top_y);
     ReadSetting("Layout", Settings::values.custom_portrait_top_width);
@@ -217,6 +222,9 @@ void Config::ReadValues() {
     ReadSetting("Layout", Settings::values.custom_portrait_bottom_y);
     ReadSetting("Layout", Settings::values.custom_portrait_bottom_width);
     ReadSetting("Layout", Settings::values.custom_portrait_bottom_height);
+
+    // Storage
+    ReadSetting("Storage", Settings::values.compress_cia_installs);
 
     // Utility
     ReadSetting("Utility", Settings::values.dump_textures);
@@ -255,6 +263,7 @@ void Config::ReadValues() {
     ReadSetting("System", Settings::values.plugin_loader_enabled);
     ReadSetting("System", Settings::values.allow_plugin_loader);
     ReadSetting("System", Settings::values.steps_per_hour);
+    ReadSetting("System", Settings::values.apply_region_free_patch);
 
     // Camera
     using namespace Service::CAM;

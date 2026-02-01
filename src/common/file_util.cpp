@@ -304,20 +304,31 @@ bool DeleteDir(const std::string& filename) {
     return false;
 }
 
-bool Rename(const std::string& srcFilename, const std::string& destFilename) {
-    LOG_TRACE(Common_Filesystem, "{} --> {}", srcFilename, destFilename);
+bool Rename(const std::string& srcFullPath, const std::string& destFullPath) {
+    LOG_TRACE(Common_Filesystem, "{} --> {}", srcFullPath, destFullPath);
 #ifdef _WIN32
-    if (_wrename(Common::UTF8ToUTF16W(srcFilename).c_str(),
-                 Common::UTF8ToUTF16W(destFilename).c_str()) == 0)
+    if (_wrename(Common::UTF8ToUTF16W(srcFullPath).c_str(),
+                 Common::UTF8ToUTF16W(destFullPath).c_str()) == 0)
         return true;
 #elif ANDROID
-    if (AndroidStorage::RenameFile(srcFilename, std::string(GetFilename(destFilename))))
-        return true;
+    // srcFullPath and destFullPath are relative to the user directory
+    if (AndroidStorage::GetBuildFlavor() == AndroidStorage::AndroidBuildFlavors::GOOGLEPLAY) {
+        if (AndroidStorage::MoveAndRenameFile(srcFullPath, destFullPath))
+            return true;
+    } else {
+        std::optional<std::string> userDirLocation = AndroidStorage::GetUserDirectory();
+        if (userDirLocation && rename((*userDirLocation + srcFullPath).c_str(),
+                                      (*userDirLocation + destFullPath).c_str()) == 0) {
+            AndroidStorage::UpdateDocumentLocation(srcFullPath, destFullPath);
+            // ^ TODO: This shouldn't fail, but what should we do if it somehow does?
+            return true;
+        }
+    }
 #else
-    if (rename(srcFilename.c_str(), destFilename.c_str()) == 0)
+    if (rename(srcFullPath.c_str(), destFullPath.c_str()) == 0)
         return true;
 #endif
-    LOG_ERROR(Common_Filesystem, "failed {} --> {}: {}", srcFilename, destFilename,
+    LOG_ERROR(Common_Filesystem, "failed {} --> {}: {}", srcFullPath, destFullPath,
               GetLastErrorMsg());
     return false;
 }
@@ -874,7 +885,6 @@ void SetUserPath(const std::string& path) {
     g_paths.emplace(UserPath::LoadDir, user_path + LOAD_DIR DIR_SEP);
     g_paths.emplace(UserPath::StatesDir, user_path + STATES_DIR DIR_SEP);
     g_paths.emplace(UserPath::IconsDir, user_path + ICONS_DIR DIR_SEP);
-    g_paths.emplace(UserPath::PlayTimeDir, user_path + LOG_DIR DIR_SEP);
     g_default_paths = g_paths;
 }
 
@@ -1187,7 +1197,7 @@ bool IOFile::SeekImpl(s64 off, int origin) {
     return m_good;
 }
 
-u64 IOFile::Tell() const {
+u64 IOFile::TellImpl() const {
     if (IsOpen())
         return ftello(m_file);
 
@@ -1224,11 +1234,18 @@ static std::size_t pread(int fd, void* buf, std::size_t count, uint64_t offset) 
 
     overlapped.OffsetHigh = static_cast<uint32_t>(offset >> 32);
     overlapped.Offset = static_cast<uint32_t>(offset & 0xFFFF'FFFFLL);
+    LARGE_INTEGER orig, dummy;
+    // TODO(PabloMK7): This is not fully async, windows being messy again...
+    // The file pos pointer will be undefined if ReadAt is used in multiple
+    // threads. Normally not problematic, but worth remembering.
+    SetFilePointerEx(file, {}, &orig, FILE_CURRENT);
     SetLastError(0);
     bool ret = ReadFile(file, buf, static_cast<uint32_t>(count), &read_bytes, &overlapped);
+    DWORD last_error = GetLastError();
+    SetFilePointerEx(file, orig, &dummy, FILE_BEGIN);
 
-    if (!ret && GetLastError() != ERROR_HANDLE_EOF) {
-        errno = GetLastError();
+    if (!ret && last_error != ERROR_HANDLE_EOF) {
+        errno = last_error;
         return std::numeric_limits<std::size_t>::max();
     }
     return read_bytes;
